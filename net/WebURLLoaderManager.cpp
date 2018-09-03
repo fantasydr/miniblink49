@@ -71,6 +71,7 @@
 #include "net/WebURLLoaderManagerAsynTask.h"
 #include "net/InitializeHandleInfo.h"
 #include "net/HeaderVisitor.h"
+#include "net/PageNetExtraData.h"
 #include "wke/wkeNetHook.h"
 #include "third_party/WebKit/Source/wtf/Threading.h"
 #include "third_party/WebKit/Source/wtf/Vector.h"
@@ -81,14 +82,11 @@
 
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
 #include "wke/wkeWebView.h"
-extern bool g_isDecodeUrlRequest;
+#include "wke/wkeGlobalVar.h"
 #endif
 #include "wtf/RefCountedLeakCounter.h"
 
 using namespace blink;
-
-extern WKE_FILE_OPEN g_pfnOpen;
-extern WKE_FILE_CLOSE g_pfnClose;
 
 namespace net {
 
@@ -160,7 +158,6 @@ void WebURLLoaderManager::initCookieSession()
     // The session cookies should be deleted before starting a new session.
 
     CURL* curl = curl_easy_init();
-
     if (!curl)
         return;
 
@@ -172,7 +169,6 @@ void WebURLLoaderManager::initCookieSession()
     }
 
     curl_easy_setopt(curl, CURLOPT_COOKIESESSION, 1);
-
     curl_easy_cleanup(curl);
 }
 
@@ -1036,7 +1032,7 @@ int WebURLLoaderManager::addAsynchronousJob(WebURLLoaderInternal* job)
     OutputDebugStringW(outString.charactersWithNullTermination().data());
 #endif
 
-    if (g_isDecodeUrlRequest && !kurl.protocolIsData()) {
+    if (wke::g_isDecodeUrlRequest && !kurl.protocolIsData()) {
         url = blink::decodeURLEscapeSequences(url);
         job->firstRequest()->setURL((blink::KURL(blink::ParsedURLString, url)));
     }
@@ -1361,6 +1357,8 @@ InitializeHandleInfo* WebURLLoaderManager::preInitializeHandleOnMainThread(WebUR
     if (0 != wkeNetInterface.length()) {
         info->wkeNetInterface = wkeNetInterface.utf8().data();
     }
+    RefPtr<net::PageNetExtraData> pageNetExtraData = page->getPageNetExtraData();
+    info->pageNetExtraData = pageNetExtraData;
 #endif
 
     return info;
@@ -1397,7 +1395,12 @@ void WebURLLoaderManager::initializeHandleOnIoThread(int jobId, InitializeHandle
     curl_easy_setopt(job->m_handle, CURLOPT_FOLLOWLOCATION, 1);
     curl_easy_setopt(job->m_handle, CURLOPT_MAXREDIRS, 10);
     curl_easy_setopt(job->m_handle, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
-    curl_easy_setopt(job->m_handle, CURLOPT_SHARE, m_curlShareHandle);
+
+    if (info->pageNetExtraData && info->pageNetExtraData->getCurlShareHandle()) {
+        curl_easy_setopt(job->m_handle, CURLOPT_SHARE, info->pageNetExtraData->getCurlShareHandle());
+        job->m_pageNetExtraData = info->pageNetExtraData;
+    } else
+        curl_easy_setopt(job->m_handle, CURLOPT_SHARE, m_curlShareHandle);
     curl_easy_setopt(job->m_handle, CURLOPT_DNS_CACHE_TIMEOUT, 60 * 5); // 5 minutes
     curl_easy_setopt(job->m_handle, CURLOPT_PROTOCOLS, kAllowedProtocols);
     curl_easy_setopt(job->m_handle, CURLOPT_REDIR_PROTOCOLS, kAllowedProtocols);
@@ -1422,10 +1425,19 @@ void WebURLLoaderManager::initializeHandleOnIoThread(int jobId, InitializeHandle
 
     curl_easy_setopt(job->m_handle, CURLOPT_URL, job->m_url);
 
-    if (m_cookieJarFileName && '\0' != m_cookieJarFileName[0]) {
-        curl_easy_setopt(job->m_handle, CURLOPT_COOKIEJAR, m_cookieJarFileName);
-        curl_easy_setopt(job->m_handle, CURLOPT_COOKIEFILE, m_cookieJarFileName);
+    std::string cookieJarFileName;
+    if (job->m_pageNetExtraData) {
+        cookieJarFileName = job->m_pageNetExtraData->getCookieJarFileName();
+    } else if (m_cookieJarFileName && '\0' != m_cookieJarFileName[0]) {
+        cookieJarFileName = m_cookieJarFileName;
     }
+
+    if (cookieJarFileName.empty()) {
+        curl_easy_setopt(job->m_handle, CURLOPT_COOKIEJAR, cookieJarFileName.c_str());
+        curl_easy_setopt(job->m_handle, CURLOPT_COOKIEFILE, cookieJarFileName.c_str());
+    }
+//     String jarPath = String::format("e:\\cookie-%d.data", info->curlShareHandle);
+//     curl_easy_setopt(job->m_handle, CURLOPT_COOKIEFILE, jarPath.utf8().data());
 
     if ("GET" == info->method) {
         curl_easy_setopt(job->m_handle, CURLOPT_HTTPGET, TRUE);
